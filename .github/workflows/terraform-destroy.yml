@@ -1,0 +1,73 @@
+name: Terraform Destroy
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '20 4 * * *'
+
+jobs:
+  terraform-run:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
+      ARM_SUBSCRIPTION_ID: "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+      ARM_TENANT_ID: "${{ secrets.AZURE_TENANT_ID }}"
+      ARM_USE_AZUREAD: true
+    outputs:
+      init_status: ${{ steps.init.outcome }}
+      apply_status: ${{ steps.apply.outputs.exitcode == '1' || steps.apply.outcome }}
+
+    steps:
+      - name: Set Git Access Token
+        run: |
+          git config --global url."https://oauth2:${{ secrets.GITHUB_TOKEN }}@github.com".insteadOf https://github.com
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+          terraform_wrapper: true
+
+      - name: Terraform Init
+        id: init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Terraform Apply
+        id: apply
+        working-directory: ./terraform
+        run: terraform apply -destroy -auto-approve -no-color 2>&1 | tee /tmp/terraform.apply
+        continue-on-error: true
+
+      - name: Terraform Apply Outcome
+        if: ${{ steps.apply.outcome == 'failure' || steps.apply.outputs.exitcode == '1' }}
+        run: exit 1
+
+  workflow-summary:
+    needs:
+      - terraform-run
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+
+    steps:
+      - name: Workflow Summary
+        env:
+          TERRAFORM_VERSION: latest
+          TF_INIT_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-run.outputs.init_status != 'success'] }}
+          TF_APPLY_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-run.outputs.apply_status != 'success'] }}
+          TF_PLAN_OR_APPLY: ${{ fromJSON('["apply", "plan"]')[needs.terraform-run.outputs.apply_status != 'success'] }}
+        run: |
+          tf_plan_or_apply_result=$([ "${{ env.TF_PLAN_OR_APPLY }}" == "apply" ] && echo "${{ env.TF_APPLY_RESULT }}" || echo "${{ env.TF_PLAN_RESULT }}")
+          echo '### WORKFLOW SUMMARY :octocat:' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '| result | job |' >> $GITHUB_STEP_SUMMARY
+          echo '|---|---|' >> $GITHUB_STEP_SUMMARY
+          echo '| '$tf_plan_or_apply_result' | terraform [${{ env.TF_PLAN_OR_APPLY }}] |' >> $GITHUB_STEP_SUMMARY

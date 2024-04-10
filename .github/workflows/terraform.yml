@@ -1,0 +1,248 @@
+name: Terraform Workflow
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  terraform-fmt:
+    runs-on: ubuntu-latest
+    outputs:
+      fmt_status: ${{ steps.fmt.outcome }}
+      diff_exists: ${{ steps.fmt_commit.outputs.diff }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+
+      - name: Terraform Format
+        id: fmt
+        run: terraform fmt -recursive
+        working-directory: ./terraform
+
+      - name: Commit files
+        id: fmt_commit
+        run: |
+          git config --local user.name "github-actions"
+          git config --local user.email "noreply@github.com"
+          if [[ -z $(git status -s) ]]; then
+            echo "diff=false" >> $GITHUB_OUTPUT
+          else
+            echo "diff=true" >> $GITHUB_OUTPUT
+          fi
+          git diff-index --quiet HEAD || git commit -m "style(terraform fmt): format code" -a
+
+      - name: Push changes
+        uses: ad-m/github-push-action@v0.6.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.event.pull_request.head.ref || github.ref }}
+
+  terraform-docs:
+    needs:
+      - terraform-fmt
+    if: ${{ needs.terraform-fmt.outputs.diff_exists == 'false' }}
+    runs-on: ubuntu-latest
+    outputs:
+      docs_status: ${{ steps.docs.outcome }}
+      diff_exists: ${{ steps.docs.outputs.num_changed > 0 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Terraform Docs
+        id: docs
+        uses: terraform-docs/gh-actions@v1.0.0
+        with:
+          working-dir: ./terraform
+          output-file: README.md
+          output-method: inject
+          args: --sort-by required --recursive --recursive-path modules
+          git-push: true
+          git-push-user-name: github-actions
+          git-push-user-email: noreply@github.com
+          git-commit-message: "docs(terraform-docs): update readme"
+
+  terraform-lint:
+    needs:
+      - terraform-fmt
+      - terraform-docs
+    if: ${{ needs.terraform-fmt.outputs.diff_exists == 'false' && needs.terraform-docs.outputs.diff_exists == 'false' }}
+    runs-on: ubuntu-latest
+    outputs:
+      lint_status: ${{ steps.lint.outcome }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get TFLint Config
+        uses: terraform-linters/tflint-load-config-action@v1
+        if: ${{ inputs.tflint_repo_config_path != '' }}
+        with:
+          source-repo: ${{ inputs.tflint_repo }}
+          source-path: ${{ inputs.tflint_repo_config_path }}
+          source-ref: ${{ inputs.tflint_repo_ref }}
+
+      - name: Run TFLint
+        uses: reviewdog/action-tflint@v1
+        id: lint
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          working_directory: ./terraform
+          tflint_version: latest
+          reporter: github-pr-check
+          fail_on_error: true
+          filter_mode: nofilter
+          level: error
+          flags: ""
+          tflint_init: true
+
+  terraform-security:
+    needs:
+      - terraform-fmt
+      - terraform-docs
+      - terraform-lint
+    if: ${{ needs.terraform-fmt.outputs.diff_exists == 'false' && needs.terraform-docs.outputs.diff_exists == 'false' }}
+    runs-on: ubuntu-latest
+    outputs:
+      security_status: ${{ steps.security.outcome }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run TFSec
+        uses: reviewdog/action-tfsec@v1
+        id: security
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          working_directory: ./terraform
+          tfsec_version: latest
+          reporter: github-pr-check
+          fail_on_error: true
+          filter_mode: nofilter
+          level: error
+          flags: ""
+          tfsec_flags: --force-all-dirs
+
+  terraform-run:
+    needs:
+      - terraform-fmt
+      - terraform-docs
+      - terraform-lint
+      - terraform-security
+    if: ${{ needs.terraform-fmt.outputs.diff_exists == 'false' && needs.terraform-docs.outputs.diff_exists == 'false' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: "${{ secrets.AZURE_CLIENT_ID }}"
+      ARM_SUBSCRIPTION_ID: "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+      ARM_TENANT_ID: "${{ secrets.AZURE_TENANT_ID }}"
+      ARM_USE_AZUREAD: true
+    outputs:
+      init_status: ${{ steps.init.outcome }}
+      plan_status: ${{ steps.plan.outputs.exitcode == '1' || steps.plan.outcome }}
+      apply_status: ${{ steps.apply.outputs.exitcode == '1' || steps.apply.outcome }}
+
+    steps:
+      - name: Set Git Access Token
+        run: |
+          git config --global url."https://oauth2:${{ secrets.GITHUB_TOKEN }}@github.com".insteadOf https://github.com
+
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: latest
+          terraform_wrapper: true
+
+      - name: Terraform Init
+        id: init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Terraform Plan
+        id: plan
+        if: ${{ github.event_name == 'pull_request' }}
+        working-directory: ./terraform
+        run: terraform plan -no-color 2>&1 | tee /tmp/terraform.plan
+        continue-on-error: true
+
+      - name: Terraform Plan Outcome
+        if: ${{ steps.plan.outcome == 'failure' || steps.plan.outputs.exitcode == '1' }}
+        run: exit 1
+
+      - name: Terraform Apply
+        id: apply
+        working-directory: ./terraform
+        if: ${{ github.event_name == 'push' }}
+        run: terraform apply -auto-approve -no-color 2>&1 | tee /tmp/terraform.apply
+        continue-on-error: true
+
+      - name: Terraform Apply Outcome
+        if: ${{ steps.apply.outcome == 'failure' || steps.apply.outputs.exitcode == '1' }}
+        run: exit 1
+
+  workflow-summary:
+    needs:
+      - terraform-fmt
+      - terraform-docs
+      - terraform-lint
+      - terraform-security
+      - terraform-run
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+
+    steps:
+      - name: Workflow Summary
+        env:
+          TERRAFORM_VERSION: latest
+          TF_FMT_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-fmt.outputs.fmt_status != 'success'] }}
+          TF_DOCS_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-docs.outputs.docs_status != 'success'] }}
+          TF_LINT_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-lint.outputs.lint_status != 'success'] }}
+          TF_SECURITY_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-security.outputs.security_status != 'success'] }}
+          TF_INIT_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-run.outputs.init_status != 'success'] }}
+          TF_PLAN_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-run.outputs.plan_status != 'success'] }}
+          TF_APPLY_RESULT: ${{ fromJSON('[":white_check_mark:", ":x:"]')[needs.terraform-run.outputs.apply_status != 'success'] }}
+          TF_PLAN_OR_APPLY: ${{ fromJSON('["apply", "plan"]')[needs.terraform-run.outputs.apply_status != 'success'] }}
+        run: |
+          tf_plan_or_apply_result=$([ "${{ env.TF_PLAN_OR_APPLY }}" == "apply" ] && echo "${{ env.TF_APPLY_RESULT }}" || echo "${{ env.TF_PLAN_RESULT }}")
+          echo '### WORKFLOW SUMMARY :octocat:' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '| result | job |' >> $GITHUB_STEP_SUMMARY
+          echo '|---|---|' >> $GITHUB_STEP_SUMMARY
+          echo '| ${{ env.TF_FMT_RESULT }} | terraform format |' >> $GITHUB_STEP_SUMMARY
+          echo '| ${{ env.TF_DOCS_RESULT }} | terraform docs |' >> $GITHUB_STEP_SUMMARY
+          echo '| ${{ env.TF_LINT_RESULT }} | terraform lint |' >> $GITHUB_STEP_SUMMARY
+          echo '| ${{ env.TF_SECURITY_RESULT }} | terraform security |' >> $GITHUB_STEP_SUMMARY
+          echo '| '$tf_plan_or_apply_result' | terraform [${{ env.TF_PLAN_OR_APPLY }}] |' >> $GITHUB_STEP_SUMMARY
